@@ -165,6 +165,7 @@ def get_args() -> argparse.Namespace:
 
     # Run modes
     parser.add_argument("--inference_only", action="store_true", help="Skip training loop")
+    parser.add_argument("--save_final", action="store_true", help="Save a final checkpoint when training exits")
     parser.add_argument("--resume", default=None, type=str,
                         help="Path to ckpt.pt to resume")
     parser.add_argument("--state_dict_path", default=None, type=str,
@@ -638,6 +639,22 @@ def train(args: argparse.Namespace) -> None:
                     )
                     if global_step < 135000:
                         model.train()
+
+        if args.save_final:
+            save_dir = Path(ckpt_root, f"final_global_step{global_step}")
+            save_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(model.state_dict(), save_dir / "model.pt")
+            save_checkpoint(
+                save_dir / "ckpt.pt",
+                model,
+                optimizer,
+                scheduler,
+                epoch=args.num_epochs,
+                global_step=global_step,
+                args=args,
+                extra={"best_hit": float(best_hit)},
+            )
+            print(f"Saved final checkpoint to {save_dir}")
 
         print("Done")
 
