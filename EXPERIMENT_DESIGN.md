@@ -294,6 +294,14 @@ local parquet -> data_full -> data_full/cache -> train
 7. 跑 finalist full。
 8. 汇总所有指标，完成简历和项目报告。
 
+正式训练入口：
+
+```bash
+bash scripts/run_taac_train.sh data_full
+```
+
+历史兼容入口 `scripts/run_hf_smoke_train.sh` 仅用于旧命令转发，后续实验记录统一使用 `TAAC_*` 环境变量和 `run_taac_train.sh`。
+
 ## 12. 最终汇总表
 
 | 类别 | 实验 | 数据 | HitRate@10 | NDCG@10 | Score | 训练时间 | 显存峰值 | 备注 |

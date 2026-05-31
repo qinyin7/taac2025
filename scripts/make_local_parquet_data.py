@@ -7,7 +7,7 @@ Expected local parquet layout:
   <parquet-root>/item_feat/*.parquet
 
 This script never calls the Hugging Face Hub. It scans local parquet files with
-pyarrow batches and writes the same output files as make_hf_smoke_data.py.
+pyarrow batches and writes the repo's standard seq.jsonl training files.
 """
 
 from __future__ import annotations
