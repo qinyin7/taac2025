@@ -279,6 +279,10 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--save_final", action="store_true", help="Save a final checkpoint when training exits")
     parser.add_argument("--save_interval", default=0, type=int,
                         help="Save/overwrite ckpt_root/latest every N training steps; 0 disables periodic latest saves")
+    parser.add_argument("--save_full_checkpoint", action="store_true",
+                        help="Also save ckpt.pt with optimizer/scheduler/RNG states. Large on full data.")
+    parser.add_argument("--save_epoch_checkpoint", action="store_true",
+                        help="Save an epoch checkpoint after each epoch eval. Disabled by default to save disk.")
     parser.add_argument("--resume", default=None, type=str,
                         help="Path to ckpt.pt to resume")
     parser.add_argument("--state_dict_path", default=None, type=str,
@@ -632,19 +636,26 @@ def train(args: argparse.Namespace) -> None:
     global_step = 0
     best_hit = 0.0
 
-    def save_run_checkpoint(save_dir: Path, epoch: int, step: int, extra: Dict | None = None) -> None:
+    def save_run_checkpoint(
+        save_dir: Path,
+        epoch: int,
+        step: int,
+        extra: Dict | None = None,
+        save_full_checkpoint: bool = True,
+    ) -> None:
         save_dir.mkdir(parents=True, exist_ok=True)
         torch.save(model.state_dict(), save_dir / "model.pt")
-        save_checkpoint(
-            save_dir / "ckpt.pt",
-            model,
-            optimizer,
-            scheduler,
-            epoch=epoch,
-            global_step=step,
-            args=args,
-            extra=extra or {"best_hit": float(best_hit)},
-        )
+        if save_full_checkpoint:
+            save_checkpoint(
+                save_dir / "ckpt.pt",
+                model,
+                optimizer,
+                scheduler,
+                epoch=epoch,
+                global_step=step,
+                args=args,
+                extra=extra or {"best_hit": float(best_hit)},
+            )
 
     # Resume
     if args.resume is not None:
@@ -737,7 +748,12 @@ def train(args: argparse.Namespace) -> None:
 
                     if args.save_interval > 0 and global_step % args.save_interval == 0:
                         latest_dir = Path(ckpt_root, "latest")
-                        save_run_checkpoint(latest_dir, epoch=epoch, step=global_step)
+                        save_run_checkpoint(
+                            latest_dir,
+                            epoch=epoch,
+                            step=global_step,
+                            save_full_checkpoint=args.save_full_checkpoint,
+                        )
                         print(f"Saved latest checkpoint to {latest_dir}")
 
                     # Periodic eval
@@ -783,6 +799,7 @@ def train(args: argparse.Namespace) -> None:
                                 **{f"hit{k}_act": float(metrics[f"hit@{k}[action!=0]"]) for k in args.topk},
                                 "best_hit": float(best_hit),
                             },
+                            save_full_checkpoint=args.save_full_checkpoint,
                         )
                         if global_step < 135000:
                             model.train()
@@ -818,31 +835,43 @@ def train(args: argparse.Namespace) -> None:
                         + ", ".join(f"{k}={metrics[f'hit@{k}[action!=0]']:.4f}" for k in args.topk)
                     )
                     best_hit = max(best_hit, float(metrics.get("hit@10[token==1]", 0.0)))
-                    epoch_dir = Path(ckpt_root, f"epoch{epoch}_global_step{global_step}")
-                    save_run_checkpoint(
-                        epoch_dir,
-                        epoch=epoch,
-                        step=global_step,
-                        extra={
-                            **{f"hit{k}_tok": float(metrics[f"hit@{k}[token==1]"]) for k in args.topk},
-                            **{f"hit{k}_act": float(metrics[f"hit@{k}[action!=0]"]) for k in args.topk},
-                            "avg_epoch_loss": float(avg_epoch_loss),
-                            "best_hit": float(best_hit),
-                        },
-                    )
+                    if args.save_epoch_checkpoint:
+                        epoch_dir = Path(ckpt_root, f"epoch{epoch}_global_step{global_step}")
+                        save_run_checkpoint(
+                            epoch_dir,
+                            epoch=epoch,
+                            step=global_step,
+                            extra={
+                                **{f"hit{k}_tok": float(metrics[f"hit@{k}[token==1]"]) for k in args.topk},
+                                **{f"hit{k}_act": float(metrics[f"hit@{k}[action!=0]"]) for k in args.topk},
+                                "avg_epoch_loss": float(avg_epoch_loss),
+                                "best_hit": float(best_hit),
+                            },
+                            save_full_checkpoint=args.save_full_checkpoint,
+                        )
                     model.train()
                 append_jsonl(Path(log_dir, "eval.log"), eval_obj)
                 if args.plot_curves:
                     plot_training_curves(log_dir)
         except KeyboardInterrupt:
             latest_dir = Path(ckpt_root, "latest")
-            save_run_checkpoint(latest_dir, epoch=current_epoch, step=global_step)
+            save_run_checkpoint(
+                latest_dir,
+                epoch=current_epoch,
+                step=global_step,
+                save_full_checkpoint=args.save_full_checkpoint,
+            )
             print(f"\nInterrupted. Saved latest checkpoint to {latest_dir}")
             raise
 
         if args.save_final:
             save_dir = Path(ckpt_root, f"final_global_step{global_step}")
-            save_run_checkpoint(save_dir, epoch=args.num_epochs, step=global_step)
+            save_run_checkpoint(
+                save_dir,
+                epoch=args.num_epochs,
+                step=global_step,
+                save_full_checkpoint=args.save_full_checkpoint,
+            )
             print(f"Saved final checkpoint to {save_dir}")
         if args.plot_curves:
             plot_training_curves(log_dir)
