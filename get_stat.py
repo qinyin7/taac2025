@@ -15,6 +15,7 @@ import math
 import argparse
 from pathlib import Path
 import polars as pl
+from tqdm import tqdm
 
 
 def get_args():
@@ -86,33 +87,28 @@ def main(data_path: str):
     if not seq_jsonl.exists():
         raise FileNotFoundError(f"Input file not found: {seq_jsonl}")
 
-    # Load as single-column CSV so each line stays intact, then map-parse JSON
-    df = (
-        pl.read_csv(
-            seq_jsonl,
-            has_header=False,
-            new_columns=["raw"],
-            separator="\u0001",  # use a rare separator to avoid splitting lines
-            quote_char=None,
-        )
-        .select(
-            pl.col("raw").map_elements(
-                parse_block,
-                return_dtype=pl.List(
-                    pl.Struct([
-                        pl.Field("user_id", pl.Utf8),
-                        pl.Field("item_id", pl.Utf8),
-                        pl.Field("action", pl.Int64),
-                        pl.Field("ts", pl.Int64),
-                    ])
-                ),
-            ).alias("events")
-        )
-        .explode("events")
-        .unnest("events")
+    print(f"Reading: {seq_jsonl}")
+    with open(seq_jsonl, "r", encoding="utf-8") as f:
+        total_lines = sum(1 for _ in f)
+
+    rows = []
+    with open(seq_jsonl, "r", encoding="utf-8") as f:
+        for line in tqdm(f, total=total_lines, desc="Parse seq.jsonl", unit="user"):
+            rows.extend(parse_block(line))
+
+    print(f"Parsed {len(rows)} item events from {total_lines} users")
+    df = pl.DataFrame(
+        rows,
+        schema={
+            "user_id": pl.Utf8,
+            "item_id": pl.Utf8,
+            "action": pl.Int64,
+            "ts": pl.Int64,
+        },
     )
 
     # (1) item_freq.csv: item occurrence counts (desc), column: occ_total
+    print("Aggregating item frequencies")
     item_freq_df = (
         df.group_by("item_id")
           .agg(pl.len().alias("occ_total"))
@@ -122,12 +118,16 @@ def main(data_path: str):
     print(f"Wrote: {item_freq}")
 
     # (2) item_last_ts_test.json: {item_id: last_ts}
+    print("Aggregating item last timestamps")
     item_last = (
         df.select([pl.col("item_id").cast(pl.Utf8), pl.col("ts").cast(pl.Int64)])
           .group_by("item_id")
           .agg(pl.max("ts").alias("last_ts"))
     )
-    mapping = {row["item_id"]: row["last_ts"] for row in item_last.iter_rows(named=True)}
+    mapping = {
+        row["item_id"]: row["last_ts"]
+        for row in tqdm(item_last.iter_rows(named=True), total=item_last.height, desc="Write last_ts", unit="item")
+    }
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(mapping, f, ensure_ascii=False)
     print(f"Wrote {len(mapping)} items to: {out_json}")

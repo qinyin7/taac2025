@@ -1,8 +1,10 @@
 .idea/
+.venv/
 __pycache__/
 *.py[cod]
 
 data/
+data_*/
 data_smoke/
 eval/
 cache/

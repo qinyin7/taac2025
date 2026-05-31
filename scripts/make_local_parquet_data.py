@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""Build a tiny local training set from TAAC2025/TencentGR-1M.
+"""Convert local TAAC2025 parquet files into this repo's seq.jsonl training format.
 
-The main training code in this repo expects:
-  - seq.jsonl
-  - seq_offsets.pkl
-  - indexer.pkl
-  - item_feat_dict.json
+Expected local parquet layout:
+  <parquet-root>/seq/*.parquet
+  <parquet-root>/user_feat/*.parquet
+  <parquet-root>/item_feat/*.parquet
 
-The public Hugging Face dataset stores the same information as parquet configs.
-This script samples a small number of users, compacts item/user/feature ids, and
-writes the minimal files needed for a quick connectivity test.
+This script never calls the Hugging Face Hub. It scans local parquet files with
+pyarrow batches and writes the same output files as make_hf_smoke_data.py.
 """
 
 from __future__ import annotations
@@ -19,12 +17,11 @@ import json
 import math
 import pickle
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Tuple
 
+import pyarrow.dataset as ds
 from tqdm import tqdm
 
-
-DATASET_ID = "TAAC2025/TencentGR-1M"
 
 ITEM_SPARSE_FIDS = [
     "100",
@@ -47,28 +44,14 @@ ALL_FIDS = ITEM_SPARSE_FIDS + USER_SPARSE_FIDS + USER_ARRAY_FIDS
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Create a tiny smoke-test dataset from TencentGR-1M")
-    parser.add_argument("--output-dir", default="data_smoke", help="Directory to write converted files")
-    parser.add_argument("--dataset-id", default=DATASET_ID)
-    parser.add_argument("--num-users", type=int, default=256, help="Number of user sequences to sample")
-    parser.add_argument(
-        "--eval-users",
-        type=int,
-        default=64,
-        help="Number of sampled users with a held-out positive event to export for local TAAC scoring",
-    )
-    parser.add_argument(
-        "--extra-items",
-        type=int,
-        default=4096,
-        help="Extra item feature rows to include so negative sampling has a wider pool",
-    )
-    parser.add_argument("--hf-cache-dir", default=None, help="Optional Hugging Face datasets cache directory")
-    parser.add_argument(
-        "--keep-original-ts",
-        action="store_true",
-        help="Keep original timestamps. By default timestamps are forced after 2025-05-29 for smoke negative sampling.",
-    )
+    parser = argparse.ArgumentParser(description="Create local training data from downloaded TAAC2025 parquet")
+    parser.add_argument("--parquet-root", required=True, help="Directory containing seq/user_feat/item_feat parquet dirs")
+    parser.add_argument("--output-dir", default="data_full")
+    parser.add_argument("--num-users", type=int, default=0, help="Users to sample from seq; 0 means all local seq rows")
+    parser.add_argument("--eval-users", type=int, default=4096)
+    parser.add_argument("--extra-items", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=8192, help="PyArrow scan batch size")
+    parser.add_argument("--keep-original-ts", action="store_true")
     return parser.parse_args()
 
 
@@ -80,13 +63,6 @@ def is_missing(value: Any) -> bool:
     return False
 
 
-def unwrap_feature_value(value: Any) -> Any:
-    """Support raw parquet values and candidate-style {feature_value: ...} dicts."""
-    if isinstance(value, dict) and "feature_value" in value:
-        return value.get("feature_value")
-    return value
-
-
 def int_or_default(value: Any, default: int = 0) -> int:
     if is_missing(value):
         return default
@@ -94,16 +70,6 @@ def int_or_default(value: Any, default: int = 0) -> int:
 
 
 def iter_seq_events(seq_obj: Any) -> Iterable[Tuple[int, int, int]]:
-    """Yield (item_id, action_type, timestamp) from HF list-of-dict or dict-of-list layouts."""
-    if isinstance(seq_obj, dict):
-        item_ids = seq_obj.get("item_id", [])
-        actions = seq_obj.get("action_type", [])
-        timestamps = seq_obj.get("timestamp", [])
-        for item_id, action, ts in zip(item_ids, actions, timestamps):
-            if not is_missing(item_id):
-                yield int(item_id), int_or_default(action), int_or_default(ts)
-        return
-
     for event in seq_obj or []:
         if not event:
             continue
@@ -116,7 +82,7 @@ def iter_seq_events(seq_obj: Any) -> Iterable[Tuple[int, int, int]]:
 def row_to_feat(row: Dict[str, Any], fids: List[str]) -> Dict[str, Any]:
     feat: Dict[str, Any] = {}
     for fid in fids:
-        value = unwrap_feature_value(row.get(fid))
+        value = row.get(fid)
         if is_missing(value):
             continue
         if isinstance(value, list):
@@ -177,52 +143,76 @@ class CompactIndex:
         }
 
 
-def load_dataset_config(dataset_id: str, name: str, split: str, cache_dir: str | None):
-    try:
-        from datasets import load_dataset
-    except ImportError as exc:
-        raise SystemExit(
-            "Missing dependency: datasets. Install it with `python -m pip install datasets pyarrow`."
-        ) from exc
-    return load_dataset(dataset_id, name=name, split=split, cache_dir=cache_dir)
+def parquet_dataset(parquet_root: Path, name: str) -> ds.Dataset:
+    path = parquet_root / name
+    if not path.exists():
+        raise FileNotFoundError(f"Missing parquet directory: {path}")
+    return ds.dataset(str(path), format="parquet")
 
 
-def dataset_len(dataset: Any) -> int | None:
+def dataset_rows(dataset: ds.Dataset) -> int | None:
     try:
-        return len(dataset)
-    except TypeError:
+        return dataset.count_rows()
+    except Exception:
         return None
+
+
+def iter_rows(
+    dataset: ds.Dataset,
+    columns: List[str],
+    batch_size: int,
+    limit: int = 0,
+) -> Iterator[Dict[str, Any]]:
+    yielded = 0
+    for batch in dataset.to_batches(columns=columns, batch_size=batch_size):
+        for row in batch.to_pylist():
+            if limit > 0 and yielded >= limit:
+                return
+            yielded += 1
+            yield row
 
 
 def main() -> None:
     args = parse_args()
+    parquet_root = Path(args.parquet_root)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    seq_split = f"train[:{args.num_users}]"
-    print(f"[1/5] Loading {args.dataset_id}/seq {seq_split}")
-    ds_seq = load_dataset_config(args.dataset_id, "seq", seq_split, args.hf_cache_dir)
+    seq_ds = parquet_dataset(parquet_root, "seq")
+    user_ds = parquet_dataset(parquet_root, "user_feat")
+    item_ds = parquet_dataset(parquet_root, "item_feat")
+    seq_total = dataset_rows(seq_ds)
 
-    selected_rows: List[Dict[str, Any]] = []
+    scan_total = min(seq_total, args.num_users) if seq_total is not None and args.num_users > 0 else seq_total
+    limit_msg = "all" if args.num_users <= 0 else str(args.num_users)
+    print(f"[1/6] Scanning local seq parquet users={limit_msg}")
+
     selected_users: set[int] = set()
     needed_items: set[int] = set()
-    for row in tqdm(ds_seq, total=dataset_len(ds_seq), desc="Scan seq", unit="user"):
+    for row in tqdm(
+        iter_rows(seq_ds, ["user_id", "seq"], args.batch_size, limit=args.num_users),
+        total=scan_total,
+        desc="Scan seq",
+        unit="user",
+    ):
         events = list(iter_seq_events(row["seq"]))
         if not events:
             continue
         raw_user_id = int(row["user_id"])
-        selected_rows.append({"user_id": raw_user_id, "events": events})
         selected_users.add(raw_user_id)
         needed_items.update(item_id for item_id, _, _ in events)
 
-    if not selected_rows:
+    if not selected_users:
         raise RuntimeError("No non-empty sequences were sampled.")
+    print(f"  users: {len(selected_users)}")
+    print(f"  sequence items: {len(needed_items)}")
 
-    print(f"[2/5] Loading user features for {len(selected_users)} users")
-    ds_user = load_dataset_config(args.dataset_id, "user_feat", "train", args.hf_cache_dir)
+    print(f"[2/6] Loading local user features for {len(selected_users)} users")
     user_feat_raw: Dict[int, Dict[str, Any]] = {}
-    with tqdm(ds_user, total=dataset_len(ds_user), desc="Scan user_feat", unit="row") as pbar:
-        for row in pbar:
+    user_total = dataset_rows(user_ds)
+    with tqdm(total=user_total, desc="Scan user_feat", unit="row") as pbar:
+        for row in iter_rows(user_ds, ["user_id"] + USER_SPARSE_FIDS + USER_ARRAY_FIDS, args.batch_size):
+            pbar.update(1)
             raw_user_id = int(row["user_id"])
             if raw_user_id in selected_users:
                 user_feat_raw[raw_user_id] = row_to_feat(row, USER_SPARSE_FIDS + USER_ARRAY_FIDS)
@@ -230,67 +220,61 @@ def main() -> None:
                 if len(user_feat_raw) == len(selected_users):
                     break
 
-    print(f"  found user features: {len(user_feat_raw)}/{len(selected_users)}")
-
-    print(f"[3/5] Loading item features for sequence items plus {args.extra_items} extras")
-    ds_item = load_dataset_config(args.dataset_id, "item_feat", "train", args.hf_cache_dir)
-    item_feat_raw: Dict[int, Dict[str, Any]] = {}
+    print(f"[3/6] Loading local item features for sequence items plus {args.extra_items} extras")
+    compact = CompactIndex()
+    item_feat_dict: Dict[str, Dict[str, Any]] = {}
     extra_count = 0
     needed_found = 0
-    with tqdm(ds_item, total=dataset_len(ds_item), desc="Scan item_feat", unit="row") as pbar:
-        for row in pbar:
+    item_total = dataset_rows(item_ds)
+    with tqdm(total=item_total, desc="Scan item_feat", unit="row") as pbar:
+        for row in iter_rows(item_ds, ["item_id"] + ITEM_SPARSE_FIDS, args.batch_size):
+            pbar.update(1)
             raw_item_id = int(row["item_id"])
             take = raw_item_id in needed_items or extra_count < args.extra_items
             if not take:
                 continue
-            if raw_item_id not in item_feat_raw:
-                item_feat_raw[raw_item_id] = row_to_feat(row, ITEM_SPARSE_FIDS)
-                if raw_item_id in needed_items:
-                    needed_found += 1
-                else:
-                    extra_count += 1
-                pbar.set_postfix(
-                    needed=f"{needed_found}/{len(needed_items)}",
-                    extras=f"{extra_count}/{args.extra_items}",
-                )
-            if needed_items.issubset(item_feat_raw.keys()) and extra_count >= args.extra_items:
+            if raw_item_id in compact.item:
+                continue
+            iid = compact.item_id(raw_item_id)
+            raw_feat = row_to_feat(row, ITEM_SPARSE_FIDS)
+            item_feat_dict[str(iid)] = compact.encode_feat(raw_feat, ITEM_SPARSE_FIDS)
+            if raw_item_id in needed_items:
+                needed_found += 1
+            else:
+                extra_count += 1
+            pbar.set_postfix(needed=f"{needed_found}/{len(needed_items)}", extras=f"{extra_count}/{args.extra_items}")
+            if needed_found >= len(needed_items) and extra_count >= args.extra_items:
                 break
 
-    print(f"  found item features: needed={needed_found}/{len(needed_items)}, extras={extra_count}/{args.extra_items}")
-
-    missing_items = needed_items - item_feat_raw.keys()
+    missing_items = needed_items - compact.item.keys()
     if missing_items:
         print(f"[warn] Missing item_feat rows for {len(missing_items)} sequence items; defaults will be used.")
 
-    print("[4/5] Compacting ids and writing files")
-    compact = CompactIndex()
-    item_feat_dict: Dict[str, Dict[str, Any]] = {}
-
-    # Register extra items first too, so they can appear in item_feat_dict and negative pools if copied later.
-    for raw_item_id, raw_feat in tqdm(item_feat_raw.items(), total=len(item_feat_raw), desc="Encode item feats", unit="item"):
-        iid = compact.item_id(raw_item_id)
-        item_feat_dict[str(iid)] = compact.encode_feat(raw_feat, ITEM_SPARSE_FIDS)
-
+    print("[4/6] Writing train files")
     offsets: List[int] = []
-    recent_floor = 1_748_454_400  # 2025-05-30 00:00:00 UTC; keeps smoke negatives "active".
+    recent_floor = 1_748_454_400
     seq_path = out_dir / "seq.jsonl"
     with open(seq_path, "wb") as f:
-        for row in tqdm(selected_rows, total=len(selected_rows), desc="Write train seq", unit="user"):
-            uid = compact.user_id(row["user_id"])
-            user_feat = compact.encode_feat(user_feat_raw.get(row["user_id"], {}), USER_SPARSE_FIDS + USER_ARRAY_FIDS)
-
+        for row in tqdm(
+            iter_rows(seq_ds, ["user_id", "seq"], args.batch_size, limit=args.num_users),
+            total=scan_total,
+            desc="Write train seq",
+            unit="user",
+        ):
+            events = list(iter_seq_events(row["seq"]))
+            if not events:
+                continue
+            raw_user_id = int(row["user_id"])
+            uid = compact.user_id(raw_user_id)
+            user_feat = compact.encode_feat(user_feat_raw.get(raw_user_id, {}), USER_SPARSE_FIDS + USER_ARRAY_FIDS)
             records: List[List[Any]] = [[uid, None, user_feat, None, None, 0]]
-            for raw_item_id, action, ts in row["events"]:
+            for raw_item_id, action, ts in events:
                 iid = compact.item_id(raw_item_id)
-                raw_feat = item_feat_raw.get(raw_item_id, {})
-                item_feat = compact.encode_feat(raw_feat, ITEM_SPARSE_FIDS)
-                item_feat_dict.setdefault(str(iid), item_feat)
+                item_feat = item_feat_dict.get(str(iid), {})
                 out_ts = int(ts if args.keep_original_ts else max(ts, recent_floor))
                 records.append([uid, iid, None, item_feat, int(action), out_ts])
-
             offsets.append(f.tell())
-            line = json.dumps(records, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            f.write(line + b"\n")
+            f.write(json.dumps(records, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n")
 
     with open(out_dir / "seq_offsets.pkl", "wb") as f:
         pickle.dump(offsets, f)
@@ -299,21 +283,28 @@ def main() -> None:
     with open(out_dir / "item_feat_dict.json", "w", encoding="utf-8") as f:
         json.dump(item_feat_dict, f, ensure_ascii=False, separators=(",", ":"))
 
+    print("[5/6] Building eval files")
     eval_rows = []
-    for row in tqdm(selected_rows, total=len(selected_rows), desc="Build eval rows", unit="user"):
+    for row in tqdm(
+        iter_rows(seq_ds, ["user_id", "seq"], args.batch_size, limit=args.num_users),
+        total=scan_total,
+        desc="Build eval rows",
+        unit="user",
+    ):
         if len(eval_rows) >= args.eval_users:
             break
-        positives = [idx for idx, (_, action, _) in enumerate(row["events"]) if int(action) > 0]
+        events = list(iter_seq_events(row["seq"]))
+        positives = [idx for idx, (_, action, _) in enumerate(events) if int(action) > 0]
         if not positives:
             continue
         target_idx = positives[-1]
         if target_idx == 0:
             continue
-        raw_item_id, action, _ = row["events"][target_idx]
+        raw_item_id, action, _ = events[target_idx]
         eval_rows.append(
             {
-                "user_id": row["user_id"],
-                "history": row["events"][:target_idx],
+                "user_id": int(row["user_id"]),
+                "history": events[:target_idx],
                 "target_item_id": raw_item_id,
                 "target_action_type": int(action),
             }
@@ -322,8 +313,6 @@ def main() -> None:
     if eval_rows:
         eval_dir = out_dir / "eval"
         eval_dir.mkdir(parents=True, exist_ok=True)
-
-        # The inference code expects the same vocab and item feature dictionary under EVAL_DATA_PATH.
         with open(eval_dir / "indexer.pkl", "wb") as f:
             pickle.dump(compact.to_indexer(), f)
         with open(eval_dir / "item_feat_dict.json", "w", encoding="utf-8") as f:
@@ -332,33 +321,23 @@ def main() -> None:
         eval_offsets: List[int] = []
         user_action_type: Dict[str, int] = {}
         ground_truth: Dict[str, List[Dict[str, Any]]] = {}
-        predict_seq_path = eval_dir / "predict_seq.jsonl"
-        with open(predict_seq_path, "wb") as f:
+        with open(eval_dir / "predict_seq.jsonl", "wb") as f:
             for row in tqdm(eval_rows, total=len(eval_rows), desc="Write eval seq", unit="user"):
                 uid = compact.user_id(row["user_id"])
                 raw_user_key = str(row["user_id"])
-                user_feat = compact.encode_feat(
-                    user_feat_raw.get(row["user_id"], {}), USER_SPARSE_FIDS + USER_ARRAY_FIDS
-                )
+                user_feat = compact.encode_feat(user_feat_raw.get(row["user_id"], {}), USER_SPARSE_FIDS + USER_ARRAY_FIDS)
                 records: List[List[Any]] = [[uid, None, user_feat, None, None, 0]]
                 for raw_item_id, action, ts in row["history"]:
                     iid = compact.item_id(raw_item_id)
-                    raw_feat = item_feat_raw.get(raw_item_id, {})
-                    item_feat = compact.encode_feat(raw_feat, ITEM_SPARSE_FIDS)
+                    item_feat = item_feat_dict.get(str(iid), {})
                     out_ts = int(ts if args.keep_original_ts else max(ts, recent_floor))
                     records.append([uid, iid, None, item_feat, int(action), out_ts])
-
                 eval_offsets.append(f.tell())
                 f.write(json.dumps(records, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n")
 
                 action_type = int(row["target_action_type"])
                 user_action_type[raw_user_key] = action_type
-                ground_truth[raw_user_key] = [
-                    {
-                        "creative_id": str(row["target_item_id"]),
-                        "action_type": action_type,
-                    }
-                ]
+                ground_truth[raw_user_key] = [{"creative_id": str(row["target_item_id"]), "action_type": action_type}]
 
         with open(eval_dir / "predict_seq_offsets.pkl", "wb") as f:
             pickle.dump(eval_offsets, f)
@@ -369,12 +348,12 @@ def main() -> None:
 
         candidate_raw_ids = []
         seen_cands = set()
-        for row in tqdm(eval_rows, total=len(eval_rows), desc="Collect eval targets", unit="user"):
+        for row in eval_rows:
             raw_item_id = row["target_item_id"]
             if raw_item_id not in seen_cands:
                 seen_cands.add(raw_item_id)
                 candidate_raw_ids.append(raw_item_id)
-        for raw_item_id in tqdm(item_feat_raw, total=len(item_feat_raw), desc="Collect candidate items", unit="item"):
+        for raw_item_id in compact.item:
             if raw_item_id in seen_cands:
                 continue
             seen_cands.add(raw_item_id)
@@ -387,9 +366,20 @@ def main() -> None:
                 rec = {"creative_id": str(raw_item_id), "features": feat}
                 f.write(json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n")
 
-    print("[5/5] Done")
+    meta = {
+        "parquet_root": str(parquet_root.resolve()),
+        "num_users": args.num_users,
+        "eval_users": args.eval_users,
+        "extra_items": args.extra_items,
+        "users_written": len(offsets),
+        "items": len(compact.item),
+    }
+    with open(out_dir / "build_meta.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    print("[6/6] Done")
     print(f"  output_dir: {out_dir.resolve()}")
-    print(f"  users:      {len(selected_rows)}")
+    print(f"  users:      {len(offsets)}")
     print(f"  items:      {len(compact.item)}")
     print(f"  seq lines:  {len(offsets)}")
     if eval_rows:

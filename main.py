@@ -166,6 +166,8 @@ def get_args() -> argparse.Namespace:
     # Run modes
     parser.add_argument("--inference_only", action="store_true", help="Skip training loop")
     parser.add_argument("--save_final", action="store_true", help="Save a final checkpoint when training exits")
+    parser.add_argument("--save_interval", default=0, type=int,
+                        help="Save/overwrite ckpt_root/latest every N training steps; 0 disables periodic latest saves")
     parser.add_argument("--resume", default=None, type=str,
                         help="Path to ckpt.pt to resume")
     parser.add_argument("--state_dict_path", default=None, type=str,
@@ -515,6 +517,20 @@ def train(args: argparse.Namespace) -> None:
     global_step = 0
     best_hit = 0.0
 
+    def save_run_checkpoint(save_dir: Path, epoch: int, step: int, extra: Dict | None = None) -> None:
+        save_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(), save_dir / "model.pt")
+        save_checkpoint(
+            save_dir / "ckpt.pt",
+            model,
+            optimizer,
+            scheduler,
+            epoch=epoch,
+            global_step=step,
+            args=args,
+            extra=extra or {"best_hit": float(best_hit)},
+        )
+
     # Resume
     if args.resume is not None:
         ckpt_path = args.resume
@@ -527,133 +543,129 @@ def train(args: argparse.Namespace) -> None:
         print(f"[Resume] {ckpt_path}: epoch={epoch_start_idx}, global_step={global_step}, best_hit={best_hit}")
 
     eval_interval = 30000
+    current_epoch = epoch_start_idx
     print("Start training")
 
-    with open(Path(log_dir, "train.log"), "w") as log_file, SummaryWriter(tf_dir) as writer:
-        for epoch in range(epoch_start_idx, args.num_epochs + 1):
-            if args.inference_only:
-                break
+    log_mode = "a" if args.resume else "w"
+    with open(Path(log_dir, "train.log"), log_mode) as log_file, SummaryWriter(tf_dir) as writer:
+        try:
+            for epoch in range(epoch_start_idx, args.num_epochs + 1):
+                current_epoch = epoch
+                if args.inference_only:
+                    break
 
-            model.train()
-            pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}")
-            for _, batch in pbar:
-                optimizer.zero_grad(set_to_none=True)
-                (
-                    seq, pos, neg,
-                    token_type, next_token_type, next_action_type,
-                    seq_time, next_time,
-                    seq_feat, pos_feat, neg_feat,
-                ) = batch
+                model.train()
+                pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}")
+                for _, batch in pbar:
+                    optimizer.zero_grad(set_to_none=True)
+                    (
+                        seq, pos, neg,
+                        token_type, next_token_type, next_action_type,
+                        seq_time, next_time,
+                        seq_feat, pos_feat, neg_feat,
+                    ) = batch
 
-                seq = seq.to(args.device)
-                pos = pos.to(args.device)
-                neg = neg.to(args.device)
+                    seq = seq.to(args.device)
+                    pos = pos.to(args.device)
+                    neg = neg.to(args.device)
 
-                # Curriculum & eval scheduling
-                hardtopk, glb_neg_ratio = set_curriculum(global_step)
-                if 0 < hardtopk < 256:
-                    eval_interval = 1000
+                    # Curriculum & eval scheduling
+                    hardtopk, glb_neg_ratio = set_curriculum(global_step)
+                    if 0 < hardtopk < 256:
+                        eval_interval = 1000
 
-                loss = model(
-                    seq,
-                    pos,
-                    neg,
-                    token_type,
-                    next_token_type,
-                    next_action_type,
-                    seq_time,
-                    seq_feat,
-                    pos_feat,
-                    neg_feat,
-                    hard_topk=hardtopk,
-                    glb_neg_ratio=glb_neg_ratio,
-                )
-
-                # Logging
-                log_obj = {"global_step": global_step, "loss": float(loss.item()), "epoch": epoch, "time": time.time()}
-                line = json.dumps(log_obj)
-                log_file.write(line + "\n")
-                log_file.flush()
-                pbar.set_postfix(loss=f"{loss.item():.4f}")
-                writer.add_scalar("Loss/train", loss.item(), global_step)
-                for i, pg in enumerate(optimizer.param_groups):
-                    writer.add_scalar(f"LR/group{i}", pg["lr"], global_step)
-
-                # Step
-                global_step += 1
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, foreach=False)
-                optimizer.step()
-                scheduler.step()
-
-                # Periodic eval
-                if global_step % eval_interval == 0:
-                    metrics = evaluate_once(
-                        model=model,
-                        dataset=dataset,
-                        valid_loader=valid_loader,
-                        device=args.device,
-                        item_emb_batch_size=args.item_emb_batch_size,
-                        ks=args.topk,
+                    loss = model(
+                        seq,
+                        pos,
+                        neg,
+                        token_type,
+                        next_token_type,
+                        next_action_type,
+                        seq_time,
+                        seq_feat,
+                        pos_feat,
+                        neg_feat,
+                        hard_topk=hardtopk,
+                        glb_neg_ratio=glb_neg_ratio,
                     )
 
-                    # TB scalars
-                    for k in args.topk:
-                        writer.add_scalar(f"Metric/Hit@{k}[token==1]", metrics[f"hit@{k}[token==1]"], global_step)
-                        writer.add_scalar(f"Metric/Hit@{k}[action!=0]", metrics[f"hit@{k}[action!=0]"], global_step)
+                    # Logging
+                    log_obj = {"global_step": global_step, "loss": float(loss.item()), "epoch": epoch, "time": time.time()}
+                    line = json.dumps(log_obj)
+                    log_file.write(line + "\n")
+                    log_file.flush()
+                    pbar.set_postfix(loss=f"{loss.item():.4f}")
+                    writer.add_scalar("Loss/train", loss.item(), global_step)
+                    for i, pg in enumerate(optimizer.param_groups):
+                        writer.add_scalar(f"LR/group{i}", pg["lr"], global_step)
 
-                    print(
-                        f"Hit@{args.topk}[token==1]: "
-                        + ", ".join(f"{k}={metrics[f'hit@{k}[token==1]']:.4f}" for k in args.topk)
-                        + f" (n={int(metrics['n[token==1]'])}) | "
-                        f"Hit@{args.topk}[action!=0]: "
-                        + ", ".join(f"{k}={metrics[f'hit@{k}[action!=0]']:.4f}" for k in args.topk)
-                        + f" (n={int(metrics['n[action!=0]'])})"
-                    )
+                    # Step
+                    global_step += 1
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, foreach=False)
+                    optimizer.step()
+                    scheduler.step()
 
-                    # Save
-                    save_dir = Path(
-                        ckpt_root,
-                        f"global_step{global_step}"
-                        + "".join(f".hit{k}_tok={metrics[f'hit@{k}[token==1]']:.4f}" for k in args.topk)
-                        + "".join(f".hit{k}_act={metrics[f'hit@{k}[action!=0]']:.4f}" for k in args.topk)
-                    )
-                    save_dir.mkdir(parents=True, exist_ok=True)
-                    torch.save(model.state_dict(), save_dir / "model.pt")
+                    if args.save_interval > 0 and global_step % args.save_interval == 0:
+                        latest_dir = Path(ckpt_root, "latest")
+                        save_run_checkpoint(latest_dir, epoch=epoch, step=global_step)
+                        print(f"Saved latest checkpoint to {latest_dir}")
 
-                    ckpt_path = save_dir / "ckpt.pt"
-                    best_hit = max(best_hit, float(metrics.get("hit@10[token==1]", 0.0)))
-                    save_checkpoint(
-                        ckpt_path,
-                        model,
-                        optimizer,
-                        scheduler,
-                        epoch=epoch,
-                        global_step=global_step,
-                        args=args,
-                        extra={
-                            **{f"hit{k}_tok": float(metrics[f"hit@{k}[token==1]"]) for k in args.topk},
-                            **{f"hit{k}_act": float(metrics[f"hit@{k}[action!=0]"]) for k in args.topk},
-                            "best_hit": float(best_hit),
-                        },
-                    )
-                    if global_step < 135000:
-                        model.train()
+                    # Periodic eval
+                    if global_step % eval_interval == 0:
+                        metrics = evaluate_once(
+                            model=model,
+                            dataset=dataset,
+                            valid_loader=valid_loader,
+                            device=args.device,
+                            item_emb_batch_size=args.item_emb_batch_size,
+                            ks=args.topk,
+                        )
+
+                        # TB scalars
+                        for k in args.topk:
+                            writer.add_scalar(f"Metric/Hit@{k}[token==1]", metrics[f"hit@{k}[token==1]"], global_step)
+                            writer.add_scalar(f"Metric/Hit@{k}[action!=0]", metrics[f"hit@{k}[action!=0]"], global_step)
+
+                        print(
+                            f"Hit@{args.topk}[token==1]: "
+                            + ", ".join(f"{k}={metrics[f'hit@{k}[token==1]']:.4f}" for k in args.topk)
+                            + f" (n={int(metrics['n[token==1]'])}) | "
+                            f"Hit@{args.topk}[action!=0]: "
+                            + ", ".join(f"{k}={metrics[f'hit@{k}[action!=0]']:.4f}" for k in args.topk)
+                            + f" (n={int(metrics['n[action!=0]'])})"
+                        )
+
+                        # Save
+                        save_dir = Path(
+                            ckpt_root,
+                            f"global_step{global_step}"
+                            + "".join(f".hit{k}_tok={metrics[f'hit@{k}[token==1]']:.4f}" for k in args.topk)
+                            + "".join(f".hit{k}_act={metrics[f'hit@{k}[action!=0]']:.4f}" for k in args.topk)
+                        )
+
+                        best_hit = max(best_hit, float(metrics.get("hit@10[token==1]", 0.0)))
+                        save_run_checkpoint(
+                            save_dir,
+                            epoch=epoch,
+                            step=global_step,
+                            extra={
+                                **{f"hit{k}_tok": float(metrics[f"hit@{k}[token==1]"]) for k in args.topk},
+                                **{f"hit{k}_act": float(metrics[f"hit@{k}[action!=0]"]) for k in args.topk},
+                                "best_hit": float(best_hit),
+                            },
+                        )
+                        if global_step < 135000:
+                            model.train()
+        except KeyboardInterrupt:
+            latest_dir = Path(ckpt_root, "latest")
+            save_run_checkpoint(latest_dir, epoch=current_epoch, step=global_step)
+            print(f"\nInterrupted. Saved latest checkpoint to {latest_dir}")
+            raise
 
         if args.save_final:
             save_dir = Path(ckpt_root, f"final_global_step{global_step}")
-            save_dir.mkdir(parents=True, exist_ok=True)
-            torch.save(model.state_dict(), save_dir / "model.pt")
-            save_checkpoint(
-                save_dir / "ckpt.pt",
-                model,
-                optimizer,
-                scheduler,
-                epoch=args.num_epochs,
-                global_step=global_step,
-                args=args,
-                extra={"best_hit": float(best_hit)},
-            )
+            save_run_checkpoint(save_dir, epoch=args.num_epochs, step=global_step)
             print(f"Saved final checkpoint to {save_dir}")
 
         print("Done")
