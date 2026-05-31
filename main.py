@@ -100,7 +100,7 @@ def load_checkpoint(
     device: str = "cpu",
 ):
     """Load states and best-effort restore RNG."""
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
 
     if optimizer is not None and "optimizer" in ckpt:
@@ -122,6 +122,117 @@ def load_checkpoint(
         print(f"[Warn] Failed to restore RNG states: {e}")
 
     return ckpt
+
+
+def append_jsonl(path: Path, obj: Dict) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def plot_training_curves(log_dir: Path | str) -> None:
+    """Write a compact PNG summary of loss, LR, curriculum, and eval metrics."""
+    log_dir = Path(log_dir)
+    train_path = log_dir / "train.log"
+    eval_path = log_dir / "eval.log"
+    if not train_path.exists():
+        return
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"[plot] matplotlib unavailable, skip curve plot: {e}")
+        return
+
+    train_rows = []
+    with open(train_path, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                train_rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    eval_rows = []
+    if eval_path.exists():
+        with open(eval_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    eval_rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+
+    if not train_rows:
+        return
+
+    steps = [int(r["global_step"]) for r in train_rows]
+    losses = [float(r["loss"]) for r in train_rows]
+    window = max(1, min(200, len(losses) // 20 or 1))
+    kernel = np.ones(window, dtype=np.float64) / window
+    smooth = np.convolve(np.asarray(losses, dtype=np.float64), kernel, mode="valid")
+    smooth_steps = steps[window - 1 :]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+    ax = axes[0, 0]
+    ax.plot(steps, losses, alpha=0.25, linewidth=0.8, label="loss")
+    ax.plot(smooth_steps, smooth, linewidth=1.8, label=f"loss_ma{window}")
+    ax.set_title("Train Loss")
+    ax.set_xlabel("global_step")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+
+    ax = axes[0, 1]
+    lr_rows = [r for r in train_rows if "lr_group0" in r]
+    if lr_rows:
+        ax.plot([int(r["global_step"]) for r in lr_rows], [float(r["lr_group0"]) for r in lr_rows], label="lr_group0")
+    hard_rows = [r for r in train_rows if "hard_topk" in r]
+    if hard_rows:
+        ax2 = ax.twinx()
+        ax2.plot(
+            [int(r["global_step"]) for r in hard_rows],
+            [float(r["hard_topk"]) for r in hard_rows],
+            color="tab:orange",
+            alpha=0.7,
+            label="hard_topk",
+        )
+        ax2.set_ylabel("hard_topk")
+    ax.set_title("LR / Curriculum")
+    ax.set_xlabel("global_step")
+    ax.grid(True, alpha=0.25)
+
+    ax = axes[1, 0]
+    epoch_rows = [r for r in eval_rows if "avg_epoch_loss" in r]
+    if epoch_rows:
+        ax.plot(
+            [int(r["epoch"]) for r in epoch_rows],
+            [float(r["avg_epoch_loss"]) for r in epoch_rows],
+            marker="o",
+            label="avg_epoch_loss",
+        )
+    ax.set_title("Epoch Loss")
+    ax.set_xlabel("epoch")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+
+    ax = axes[1, 1]
+    metric_rows = [r for r in eval_rows if "hit@10[token==1]" in r or "hit@10[action!=0]" in r]
+    if metric_rows:
+        x = [int(r["epoch"]) for r in metric_rows]
+        if "hit@10[token==1]" in metric_rows[0]:
+            ax.plot(x, [float(r.get("hit@10[token==1]", 0.0)) for r in metric_rows], marker="o", label="Hit@10 token")
+        if "hit@10[action!=0]" in metric_rows[0]:
+            ax.plot(x, [float(r.get("hit@10[action!=0]", 0.0)) for r in metric_rows], marker="o", label="Hit@10 action")
+    ax.set_title("Epoch Eval")
+    ax.set_xlabel("epoch")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+
+    fig.tight_layout()
+    out_path = log_dir / "training_curves.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"[plot] Wrote {out_path}")
 
 
 # ------------------------------
@@ -177,6 +288,10 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--eval_batch_size", default=512, type=int)
     parser.add_argument("--item_emb_batch_size", default=8192, type=int)
     parser.add_argument("--topk", nargs="+", default=[10, 100], type=int)
+    parser.add_argument("--eval_each_epoch", action="store_true",
+                        help="Run retrieval eval after every training epoch")
+    parser.add_argument("--plot_curves", action="store_true",
+                        help="Write log_dir/training_curves.png after epoch eval and final save")
 
     # MM embedding Feature IDs
     parser.add_argument("--mm_emb_id", nargs="+", default=[], type=str, choices=[str(s) for s in range(81, 87)])
@@ -555,6 +670,8 @@ def train(args: argparse.Namespace) -> None:
                     break
 
                 model.train()
+                epoch_loss_sum = 0.0
+                epoch_loss_count = 0
                 pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}")
                 for _, batch in pbar:
                     optimizer.zero_grad(set_to_none=True)
@@ -590,12 +707,24 @@ def train(args: argparse.Namespace) -> None:
                     )
 
                     # Logging
-                    log_obj = {"global_step": global_step, "loss": float(loss.item()), "epoch": epoch, "time": time.time()}
+                    current_loss = float(loss.item())
+                    current_lrs = {f"lr_group{i}": float(pg["lr"]) for i, pg in enumerate(optimizer.param_groups)}
+                    log_obj = {
+                        "global_step": global_step,
+                        "loss": current_loss,
+                        "epoch": epoch,
+                        "time": time.time(),
+                        "hard_topk": int(hardtopk),
+                        "glb_neg_ratio": float(glb_neg_ratio),
+                        **current_lrs,
+                    }
                     line = json.dumps(log_obj)
                     log_file.write(line + "\n")
                     log_file.flush()
-                    pbar.set_postfix(loss=f"{loss.item():.4f}")
-                    writer.add_scalar("Loss/train", loss.item(), global_step)
+                    epoch_loss_sum += current_loss
+                    epoch_loss_count += 1
+                    pbar.set_postfix(loss=f"{current_loss:.4f}")
+                    writer.add_scalar("Loss/train", current_loss, global_step)
                     for i, pg in enumerate(optimizer.param_groups):
                         writer.add_scalar(f"LR/group{i}", pg["lr"], global_step)
 
@@ -657,6 +786,54 @@ def train(args: argparse.Namespace) -> None:
                         )
                         if global_step < 135000:
                             model.train()
+
+                avg_epoch_loss = epoch_loss_sum / max(epoch_loss_count, 1)
+                writer.add_scalar("Loss/epoch_avg", avg_epoch_loss, epoch)
+                eval_obj = {
+                    "event": "epoch_end",
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "avg_epoch_loss": float(avg_epoch_loss),
+                    "time": time.time(),
+                }
+                if args.eval_each_epoch:
+                    metrics = evaluate_once(
+                        model=model,
+                        dataset=dataset,
+                        valid_loader=valid_loader,
+                        device=args.device,
+                        item_emb_batch_size=args.item_emb_batch_size,
+                        ks=args.topk,
+                    )
+                    eval_obj.update({k: float(v) for k, v in metrics.items()})
+                    for k in args.topk:
+                        writer.add_scalar(f"EpochMetric/Hit@{k}[token==1]", metrics[f"hit@{k}[token==1]"], epoch)
+                        writer.add_scalar(f"EpochMetric/Hit@{k}[action!=0]", metrics[f"hit@{k}[action!=0]"], epoch)
+                    print(
+                        f"[Epoch {epoch}] avg_loss={avg_epoch_loss:.4f} | "
+                        f"Hit@{args.topk}[token==1]: "
+                        + ", ".join(f"{k}={metrics[f'hit@{k}[token==1]']:.4f}" for k in args.topk)
+                        + " | "
+                        f"Hit@{args.topk}[action!=0]: "
+                        + ", ".join(f"{k}={metrics[f'hit@{k}[action!=0]']:.4f}" for k in args.topk)
+                    )
+                    best_hit = max(best_hit, float(metrics.get("hit@10[token==1]", 0.0)))
+                    epoch_dir = Path(ckpt_root, f"epoch{epoch}_global_step{global_step}")
+                    save_run_checkpoint(
+                        epoch_dir,
+                        epoch=epoch,
+                        step=global_step,
+                        extra={
+                            **{f"hit{k}_tok": float(metrics[f"hit@{k}[token==1]"]) for k in args.topk},
+                            **{f"hit{k}_act": float(metrics[f"hit@{k}[action!=0]"]) for k in args.topk},
+                            "avg_epoch_loss": float(avg_epoch_loss),
+                            "best_hit": float(best_hit),
+                        },
+                    )
+                    model.train()
+                append_jsonl(Path(log_dir, "eval.log"), eval_obj)
+                if args.plot_curves:
+                    plot_training_curves(log_dir)
         except KeyboardInterrupt:
             latest_dir = Path(ckpt_root, "latest")
             save_run_checkpoint(latest_dir, epoch=current_epoch, step=global_step)
@@ -667,6 +844,8 @@ def train(args: argparse.Namespace) -> None:
             save_dir = Path(ckpt_root, f"final_global_step{global_step}")
             save_run_checkpoint(save_dir, epoch=args.num_epochs, step=global_step)
             print(f"Saved final checkpoint to {save_dir}")
+        if args.plot_curves:
+            plot_training_curves(log_dir)
 
         print("Done")
 

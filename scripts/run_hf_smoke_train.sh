@@ -17,6 +17,7 @@ SMOKE_DIR="${1:-$ROOT_DIR/data_smoke}"
 : "${SMOKE_SAVE_INTERVAL:=100}"
 : "${SMOKE_BATCH_SIZE:=96}"
 : "${SMOKE_EVAL_BATCH_SIZE:=128}"
+: "${SMOKE_NUM_WORKERS:=0}"
 : "${SMOKE_MAXLEN:=96}"
 : "${SMOKE_VAL_RATIO:=0.1}"
 : "${SMOKE_NUM_EPOCHS:=10}"
@@ -24,6 +25,8 @@ SMOKE_DIR="${1:-$ROOT_DIR/data_smoke}"
 : "${SMOKE_HIDDEN_UNITS:=128}"
 : "${SMOKE_NUM_HEADS:=8}"
 : "${SMOKE_ITEM_EMB_BATCH_SIZE:=8192}"
+: "${SMOKE_EVAL_EACH_EPOCH:=1}"
+: "${SMOKE_PLOT_CURVES:=1}"
 : "${SMOKE_DEVICE:=cuda}"
 : "${SMOKE_RUN_NAME:=h${SMOKE_HIDDEN_UNITS}_b${SMOKE_NUM_BLOCKS}_l${SMOKE_MAXLEN}_bs${SMOKE_BATCH_SIZE}}"
 
@@ -81,6 +84,14 @@ else
   echo "[resume] Starting a fresh training run"
 fi
 
+EXTRA_TRAIN_ARGS=()
+if [[ "$SMOKE_EVAL_EACH_EPOCH" == "1" ]]; then
+  EXTRA_TRAIN_ARGS+=(--eval_each_epoch)
+fi
+if [[ "$SMOKE_PLOT_CURVES" == "1" ]]; then
+  EXTRA_TRAIN_ARGS+=(--plot_curves)
+fi
+
 python -u main.py \
   --data_path "$TRAIN_DATA_PATH" \
   --ckpt_root "$TRAIN_CKPT_PATH" \
@@ -89,7 +100,7 @@ python -u main.py \
   --batch_size "$SMOKE_BATCH_SIZE" \
   --eval_batch_size "$SMOKE_EVAL_BATCH_SIZE" \
   --maxlen "$SMOKE_MAXLEN" \
-  --num_workers 0 \
+  --num_workers "$SMOKE_NUM_WORKERS" \
   --val_ratio "$SMOKE_VAL_RATIO" \
   --num_epochs "$SMOKE_NUM_EPOCHS" \
   --num_blocks "$SMOKE_NUM_BLOCKS" \
@@ -100,6 +111,7 @@ python -u main.py \
   --topk 10 \
   --save_interval "$SMOKE_SAVE_INTERVAL" \
   --save_final \
+  "${EXTRA_TRAIN_ARGS[@]}" \
   "${RESUME_ARGS[@]}"
 
 FINAL_MODEL_DIR=""
